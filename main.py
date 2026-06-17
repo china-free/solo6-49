@@ -23,8 +23,8 @@ def main():
 
     config = AppConfig.load()
     monitor_manager = MonitorManager()
-    wallpaper_setter = WallpaperSetter(monitor_manager)
     cache = WallpaperCache()
+    wallpaper_setter = WallpaperSetter(monitor_manager, cache=cache)
     history = WallpaperHistory()
     scheduler = WallpaperScheduler(config, monitor_manager, wallpaper_setter, cache, history)
 

@@ -169,16 +169,18 @@ class MainWindow(QWidget):
         layout.addWidget(self.lbl_current_path)
 
         ctrl_layout = QHBoxLayout()
-        ctrl_layout.setSpacing(10)
+        ctrl_layout.setSpacing(8)
 
-        self.btn_prev = QPushButton("⏮️ 上一张")
+        self.btn_prev = QPushButton("⏮️ 浏览上一张")
         self.btn_prev.setStyleSheet(self._btn_style("#2196f3", "#1976d2"))
-        self.btn_next = QPushButton("⏭️ 下一张/跳过")
+        self.btn_next = QPushButton("⏭️ 浏览下一张")
         self.btn_next.setStyleSheet(self._btn_style("#4caf50", "#388e3c"))
+        self.btn_skip = QPushButton("⏩ 跳过当前")
+        self.btn_skip.setStyleSheet(self._btn_style("#9c27b0", "#7b1fa2"))
         self.btn_apply = QPushButton("✔️ 应用此壁纸")
         self.btn_apply.setStyleSheet(self._btn_style("#ff9800", "#f57c00"))
 
-        for btn in [self.btn_prev, self.btn_next, self.btn_apply]:
+        for btn in [self.btn_prev, self.btn_next, self.btn_skip, self.btn_apply]:
             btn.setMinimumHeight(40)
             ctrl_layout.addWidget(btn)
 
@@ -307,14 +309,17 @@ class MainWindow(QWidget):
     def _connect_signals(self):
         self.btn_add_folder.clicked.connect(self._add_folder)
         self.btn_remove_folder.clicked.connect(self._remove_folder)
-        self.btn_next.clicked.connect(lambda: self._on_skip_next(True))
-        self.btn_prev.clicked.connect(lambda: self._on_skip_next(False))
+        self.btn_next.clicked.connect(lambda: self._on_browse(forward=True))
+        self.btn_prev.clicked.connect(lambda: self._on_browse(forward=False))
+        self.btn_skip.clicked.connect(self._on_skip)
         self.btn_apply.clicked.connect(self._on_apply_selected)
         self.btn_toggle_run.clicked.connect(self._toggle_scheduler)
         self.monitor_combo.clicked.connect(self._show_monitor_menu)
         self._scheduler.wallpaper_changed.connect(self._on_wallpaper_changed)
+        self._scheduler.preview_changed.connect(self._on_preview_changed)
         self._scheduler.schedule_updated.connect(self._on_schedule_updated)
         self.history_list.itemDoubleClicked.connect(self._on_history_double_clicked)
+        self.history_list.itemClicked.connect(self._on_history_clicked)
 
     def _update_monitor_combo(self):
         monitors = self._monitor_manager.get_monitors()
@@ -364,7 +369,11 @@ class MainWindow(QWidget):
             monitors = self._monitor_manager.get_monitors()
             if monitors:
                 mid = monitors[0].monitor_id
-        current = self._scheduler.get_current_wallpaper(mid) if mid else None
+        current = None
+        if mid is not None:
+            current = self._scheduler.get_preview_wallpaper(mid)
+        if not current or not os.path.exists(current):
+            current = self._scheduler.get_current_wallpaper(mid) if mid else None
         if not current or not os.path.exists(current):
             pool = self._scheduler.get_pool()
             if pool:
@@ -374,21 +383,37 @@ class MainWindow(QWidget):
                 self.preview_label.setPixmap(QPixmap())
                 self.lbl_current_path.setText("")
                 return
+        self._render_preview(current)
+
+    def _render_preview(self, file_path: str):
+        if not file_path or not os.path.exists(file_path):
+            self.preview_label.setText("无预览")
+            self.preview_label.setPixmap(QPixmap())
+            self.lbl_current_path.setText(file_path or "")
+            return
         try:
-            img = Image.open(current)
+            img = Image.open(file_path)
             img.thumbnail((700, 450), Image.LANCZOS)
-            if img.mode == "RGBA":
+            if img.mode in ("RGBA", "P", "LA"):
                 img = img.convert("RGB")
             data = img.tobytes("raw", "RGB")
             qimg = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg.copy())
             self.preview_label.setPixmap(pixmap)
             self.preview_label.setText("")
-            self.lbl_current_path.setText(f"📄 {current}")
+            mid = self._selected_monitor_id
+            tag = ""
+            if mid is not None:
+                cur = self._scheduler.get_current_wallpaper(mid)
+                if cur and os.path.abspath(cur) == os.path.abspath(file_path):
+                    tag = "  [当前桌面]"
+                else:
+                    tag = "  [预览中 - 尚未应用]"
+            self.lbl_current_path.setText(f"📄 {file_path}{tag}")
         except Exception as e:
-            self.preview_label.setText(f"无法加载预览：{current}\n{e}")
+            self.preview_label.setText(f"无法加载预览：\n{file_path}\n{e}")
             self.preview_label.setPixmap(QPixmap())
-            self.lbl_current_path.setText(current)
+            self.lbl_current_path.setText(file_path)
 
     def _refresh_history(self):
         self.history_list.clear()
@@ -454,18 +479,49 @@ class MainWindow(QWidget):
 
     def _on_skip_next(self, forward: bool):
         if self._config.per_monitor_wallpaper:
+            if forward:
+                self._scheduler.switch_next(self._selected_monitor_id)
+            else:
+                self._scheduler.switch_prev(self._selected_monitor_id)
+        else:
+            if forward:
+                self._scheduler.switch_next()
+            else:
+                self._scheduler.switch_prev()
+
+    def _on_browse(self, forward: bool):
+        if self._scheduler.get_pool_size() == 0:
+            QMessageBox.information(self, "提示", "请先添加壁纸文件夹")
+            return
+        mid = self._selected_monitor_id if self._config.per_monitor_wallpaper else None
+        if forward:
+            self._scheduler.peek_next(mid)
+        else:
+            self._scheduler.peek_prev(mid)
+
+    def _on_skip(self):
+        if self._scheduler.get_pool_size() == 0:
+            QMessageBox.information(self, "提示", "请先添加壁纸文件夹")
+            return
+        if self._config.per_monitor_wallpaper:
             self._scheduler.switch_next(self._selected_monitor_id)
         else:
             self._scheduler.switch_next()
 
     def _on_apply_selected(self):
-        if self.lbl_current_path.text():
-            path = self.lbl_current_path.text().replace("📄 ", "").strip()
-            if path and os.path.exists(path):
-                if self._config.per_monitor_wallpaper:
-                    self._scheduler.switch_to(path, self._selected_monitor_id)
-                else:
-                    self._scheduler.switch_to(path)
+        mid = self._selected_monitor_id if self._config.per_monitor_wallpaper else None
+        applied = self._scheduler.apply_preview(mid)
+        if applied:
+            return
+        path_text = self.lbl_current_path.text()
+        if not path_text:
+            return
+        path = path_text.split("  [", 1)[0].replace("📄 ", "").strip()
+        if path and os.path.exists(path):
+            if self._config.per_monitor_wallpaper:
+                self._scheduler.switch_to(path, self._selected_monitor_id)
+            else:
+                self._scheduler.switch_to(path)
 
     def _toggle_scheduler(self):
         if self._scheduler.is_running():
@@ -498,16 +554,33 @@ class MainWindow(QWidget):
         QTimer.singleShot(1000, self._update_countdown)
 
     def _on_wallpaper_changed(self, wallpapers: dict):
+        self._scheduler.reset_preview()
         self._refresh_preview()
         self._refresh_history()
+
+    def _on_preview_changed(self, monitor_id: str, file_path: str):
+        if monitor_id == self._selected_monitor_id or not self._config.per_monitor_wallpaper:
+            self._render_preview(file_path)
 
     def _on_schedule_updated(self, minutes: int):
         pass
 
+    def _on_history_clicked(self, item: QListWidgetItem):
+        path = item.data(Qt.UserRole)
+        if not path or not os.path.exists(path):
+            return
+        mid = self._selected_monitor_id if self._config.per_monitor_wallpaper else None
+        if mid is not None:
+            self._scheduler.reset_preview(mid)
+        else:
+            self._scheduler.reset_preview()
+        self._render_preview(path)
+        self.lbl_current_path.setText(f"📄 {path}  [从历史预览 - 尚未应用]")
+
     def _on_history_double_clicked(self, item: QListWidgetItem):
         path = item.data(Qt.UserRole)
         if path and os.path.exists(path):
-            if QMessageBox.question(self, "确认", f"应用此壁纸？\n{path}") == QMessageBox.Yes:
+            if QMessageBox.question(self, "确认", f"应用此壁纸到桌面？\n{path}") == QMessageBox.Yes:
                 if self._config.per_monitor_wallpaper:
                     self._scheduler.switch_to(path, self._selected_monitor_id)
                 else:

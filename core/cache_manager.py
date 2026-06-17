@@ -1,8 +1,9 @@
 import json
 import os
+import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Union
 from collections import OrderedDict
 from PIL import Image
 
@@ -13,11 +14,15 @@ MAX_CACHE_SIZE = 200
 MAX_HISTORY_ITEMS = 100
 
 
+def _make_key(*parts: str) -> str:
+    return "|".join(str(p) for p in parts)
+
+
 class WallpaperCache:
     def __init__(self):
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._cache_index_file = os.path.join(CACHE_DIR, "index.json")
-        self._cache: OrderedDict = OrderedDict()
+        self._cache: "OrderedDict[str, str]" = OrderedDict()
         self._load_index()
 
     def _load_index(self):
@@ -25,48 +30,98 @@ class WallpaperCache:
             try:
                 with open(self._cache_index_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self._cache = OrderedDict(data)
+                if isinstance(data, list):
+                    self._cache = OrderedDict(data)
+                elif isinstance(data, dict):
+                    self._cache = OrderedDict(data.items())
+                else:
+                    self._cache = OrderedDict()
             except (json.JSONDecodeError, TypeError):
                 self._cache = OrderedDict()
 
     def _save_index(self):
+        os.makedirs(CACHE_DIR, exist_ok=True)
         with open(self._cache_index_file, "w", encoding="utf-8") as f:
             json.dump(list(self._cache.items()), f, ensure_ascii=False, indent=2)
 
-    def _get_cache_path(self, file_path: str) -> str:
-        import hashlib
-        file_hash = hashlib.md5(file_path.encode("utf-8")).hexdigest()
-        return os.path.join(CACHE_DIR, f"{file_hash}.jpg")
+    def _hash_key(self, key: str) -> str:
+        return hashlib.md5(key.encode("utf-8")).hexdigest()
 
-    def get(self, file_path: str) -> Optional[Image.Image]:
-        if file_path in self._cache:
-            self._cache.move_to_end(file_path)
-            cache_path = self._cache[file_path]
-            if os.path.exists(cache_path):
+    def _cache_path_for(self, key: str) -> str:
+        return os.path.join(CACHE_DIR, f"{self._hash_key(key)}.jpg")
+
+    def _evict_if_needed(self):
+        while len(self._cache) > MAX_CACHE_SIZE:
+            _, old_cache_path = self._cache.popitem(last=False)
+            if old_cache_path and os.path.exists(old_cache_path):
                 try:
-                    return Image.open(cache_path)
+                    os.remove(old_cache_path)
                 except Exception:
                     pass
+
+    def get_image(self, file_path: str) -> Optional[Image.Image]:
+        cache_path = self.get_path(file_path)
+        if cache_path and os.path.exists(cache_path):
+            try:
+                return Image.open(cache_path)
+            except Exception:
+                return None
         return None
 
-    def put(self, file_path: str, image: Image.Image) -> str:
-        cache_path = self._get_cache_path(file_path)
+    def get_path(self, *key_parts: str) -> Optional[str]:
+        key = _make_key(*key_parts)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            cache_path = self._cache[key]
+            if os.path.exists(cache_path):
+                self._save_index()
+                return cache_path
+            else:
+                del self._cache[key]
+        return None
+
+    def put_image(self, file_path: str, image: Image.Image) -> str:
+        return self.put(file_path, image)
+
+    def put(self, *key_parts_or_image: Union[str, Image.Image]) -> str:
+        if len(key_parts_or_image) < 2:
+            raise ValueError("put() 需要 key 部分和一个 PIL Image")
+        image = key_parts_or_image[-1]
+        key_parts = key_parts_or_image[:-1]
+        if not isinstance(image, Image.Image):
+            raise ValueError("put() 最后一个参数必须是 PIL Image")
+        key = _make_key(*key_parts)
+        cache_path = self._cache_path_for(key)
         try:
-            if image.mode in ("RGBA", "P"):
-                image = image.convert("RGB")
-            image.save(cache_path, "JPEG", quality=90)
-            self._cache[file_path] = cache_path
-            if len(self._cache) > MAX_CACHE_SIZE:
-                old_path, old_cache = self._cache.popitem(last=False)
-                if os.path.exists(old_cache):
-                    try:
-                        os.remove(old_cache)
-                    except Exception:
-                        pass
+            img = image
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            img.save(cache_path, "JPEG", quality=92)
+            self._cache[key] = cache_path
+            self._cache.move_to_end(key)
+            self._evict_if_needed()
             self._save_index()
             return cache_path
         except Exception:
-            return file_path
+            return ""
+
+    def load_or_process(
+        self,
+        *key_parts: str,
+        processor,
+    ) -> Tuple[Optional[str], Optional[Image.Image]]:
+        key = _make_key(*key_parts)
+        cached_path = self.get_path(key)
+        if cached_path:
+            try:
+                return cached_path, Image.open(cached_path)
+            except Exception:
+                pass
+        result_img = processor()
+        if result_img is None:
+            return None, None
+        saved_path = self.put(key, result_img)
+        return saved_path or None, result_img
 
     def clear(self):
         self._cache.clear()
@@ -89,6 +144,8 @@ class WallpaperHistory:
             try:
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                     self._history = json.load(f)
+                if not isinstance(self._history, list):
+                    self._history = []
             except (json.JSONDecodeError, TypeError):
                 self._history = []
 

@@ -16,6 +16,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", "
 
 class WallpaperScheduler(QObject):
     wallpaper_changed = Signal(dict)
+    preview_changed = Signal(str, str)
     next_wallpaper_selected = Signal(str, str)
     schedule_updated = Signal(int)
 
@@ -38,6 +39,7 @@ class WallpaperScheduler(QObject):
         self._is_running = False
         self._wallpaper_pool: List[str] = []
         self._current_wallpapers: Dict[str, str] = {}
+        self._preview_wallpapers: Dict[str, str] = {}
         self._refresh_pool()
         self._apply_interval()
 
@@ -70,6 +72,11 @@ class WallpaperScheduler(QObject):
     def get_current_wallpaper(self, monitor_id: str) -> Optional[str]:
         return self._current_wallpapers.get(monitor_id)
 
+    def get_preview_wallpaper(self, monitor_id: str) -> Optional[str]:
+        if monitor_id in self._preview_wallpapers:
+            return self._preview_wallpapers[monitor_id]
+        return self.get_current_wallpaper(monitor_id)
+
     def get_all_current(self) -> Dict[str, str]:
         return dict(self._current_wallpapers)
 
@@ -94,6 +101,138 @@ class WallpaperScheduler(QObject):
         if self._is_running and not self._timer.isActive():
             self._timer.start()
 
+    def _resolve_preview_monitor(self, monitor_id: Optional[str]) -> Optional[str]:
+        if monitor_id is not None:
+            return monitor_id
+        if self._config.per_monitor_wallpaper:
+            primary = self._monitor_manager.get_primary_monitor()
+            return primary.monitor_id if primary else None
+        monitors = self._monitor_manager.get_monitors()
+        return monitors[0].monitor_id if monitors else None
+
+    def _get_index(self, monitor_id: str, default: int = -1) -> int:
+        idx_key = f"idx_{monitor_id}"
+        idx = self._config.current_indexes.get(idx_key, default)
+        if not isinstance(idx, int):
+            return default
+        return idx
+
+    def _set_index(self, monitor_id: str, idx: int):
+        n = len(self._wallpaper_pool)
+        if n <= 0:
+            return
+        idx_key = f"idx_{monitor_id}"
+        self._config.current_indexes[idx_key] = idx % n
+        self._config.save()
+
+    def _get_preview_index(self, monitor_id: str) -> int:
+        idx_key = f"preview_idx_{monitor_id}"
+        idx = self._config.current_indexes.get(idx_key)
+        if isinstance(idx, int):
+            return idx
+        ci = self._get_index(monitor_id, 0)
+        return ci
+
+    def _set_preview_index(self, monitor_id: str, idx: int):
+        n = len(self._wallpaper_pool)
+        if n <= 0:
+            return
+        idx_key = f"preview_idx_{monitor_id}"
+        self._config.current_indexes[idx_key] = idx % n
+        self._config.save()
+
+    def _path_at(self, idx: int) -> Optional[str]:
+        if not self._wallpaper_pool:
+            return None
+        n = len(self._wallpaper_pool)
+        return self._wallpaper_pool[idx % n]
+
+    def _index_of(self, path: Optional[str]) -> int:
+        if not path or not self._wallpaper_pool:
+            return -1
+        try:
+            return self._wallpaper_pool.index(path)
+        except ValueError:
+            return -1
+
+    def _peek(self, monitor_id: str, forward: bool) -> Optional[str]:
+        if not self._wallpaper_pool:
+            return None
+        mode = self._config.switch_mode
+        n = len(self._wallpaper_pool)
+        if mode == "random":
+            current = self._preview_wallpapers.get(
+                monitor_id, self._current_wallpapers.get(monitor_id)
+            )
+            candidates = [p for p in self._wallpaper_pool if p != current]
+            if not candidates:
+                candidates = self._wallpaper_pool
+            return random.choice(candidates)
+        else:
+            preview_idx = self._get_preview_index(monitor_id)
+            if preview_idx < 0 or preview_idx >= n:
+                preview_idx = self._index_of(self._current_wallpapers.get(monitor_id))
+                if preview_idx < 0:
+                    preview_idx = 0
+            step = 1 if forward else -1
+            new_idx = (preview_idx + step) % n
+            if new_idx == preview_idx and n > 1:
+                new_idx = (new_idx + step) % n
+            self._set_preview_index(monitor_id, new_idx)
+            return self._path_at(new_idx)
+
+    def peek_next(self, monitor_id: Optional[str] = None) -> Optional[str]:
+        mid = self._resolve_preview_monitor(monitor_id)
+        if mid is None:
+            return None
+        path = self._peek(mid, forward=True)
+        if path:
+            self._preview_wallpapers[mid] = path
+            self.preview_changed.emit(mid, path)
+        return path
+
+    def peek_prev(self, monitor_id: Optional[str] = None) -> Optional[str]:
+        mid = self._resolve_preview_monitor(monitor_id)
+        if mid is None:
+            return None
+        path = self._peek(mid, forward=False)
+        if path:
+            self._preview_wallpapers[mid] = path
+            self.preview_changed.emit(mid, path)
+        return path
+
+    def reset_preview(self, monitor_id: Optional[str] = None):
+        if monitor_id is None:
+            for mid in list(self._preview_wallpapers.keys()):
+                cur = self._current_wallpapers.get(mid)
+                if cur is not None:
+                    self._set_preview_index(mid, self._index_of(cur))
+                    self.preview_changed.emit(mid, cur)
+            self._preview_wallpapers.clear()
+        else:
+            self._preview_wallpapers.pop(monitor_id, None)
+            cur = self._current_wallpapers.get(monitor_id)
+            if cur is not None:
+                self._set_preview_index(monitor_id, self._index_of(cur))
+                self.preview_changed.emit(monitor_id, cur)
+
+    def apply_preview(self, monitor_id: Optional[str] = None) -> bool:
+        if monitor_id is not None:
+            path = self._preview_wallpapers.get(monitor_id)
+            if not path:
+                return False
+            ok = self.switch_to(path, monitor_id)
+            if ok:
+                self._preview_wallpapers.pop(monitor_id, None)
+            return ok
+        applied_any = False
+        for mid in list(self._preview_wallpapers.keys()):
+            path = self._preview_wallpapers[mid]
+            if self.switch_to(path, mid):
+                applied_any = True
+        self._preview_wallpapers.clear()
+        return applied_any
+
     def _select_next(self, monitor_id: str) -> Optional[str]:
         if not self._wallpaper_pool:
             return None
@@ -104,16 +243,37 @@ class WallpaperScheduler(QObject):
                 candidates = self._wallpaper_pool
             return random.choice(candidates)
         else:
-            idx_key = str(monitor_id)
-            idx = self._config.current_indexes.get(idx_key, 0)
-            if not isinstance(idx, int):
-                idx = 0
+            idx = self._get_index(monitor_id, -1)
+            if idx < 0 or idx >= len(self._wallpaper_pool):
+                idx = self._index_of(self._current_wallpapers.get(monitor_id))
             idx = (idx + 1) % len(self._wallpaper_pool)
-            self._config.current_indexes[idx_key] = idx
-            self._config.save()
-            return self._wallpaper_pool[idx]
+            self._set_index(monitor_id, idx)
+            path = self._path_at(idx)
+            self._set_preview_index(monitor_id, idx)
+            return path
 
-    def _select_next_for_all(self) -> Dict[str, str]:
+    def _select_prev(self, monitor_id: str) -> Optional[str]:
+        if not self._wallpaper_pool:
+            return None
+        mode = self._config.switch_mode
+        if mode == "random":
+            candidates = [p for p in self._wallpaper_pool if p != self._current_wallpapers.get(monitor_id)]
+            if not candidates:
+                candidates = self._wallpaper_pool
+            return random.choice(candidates)
+        else:
+            idx = self._get_index(monitor_id, 0)
+            if idx <= 0 or idx >= len(self._wallpaper_pool):
+                idx = self._index_of(self._current_wallpapers.get(monitor_id))
+                if idx < 0:
+                    idx = 0
+            idx = (idx - 1) % len(self._wallpaper_pool)
+            self._set_index(monitor_id, idx)
+            path = self._path_at(idx)
+            self._set_preview_index(monitor_id, idx)
+            return path
+
+    def _select_next_for_all(self, forward: bool = True) -> Dict[str, str]:
         monitors = self._monitor_manager.get_monitors()
         wallpapers = {}
         if self._config.per_monitor_wallpaper:
@@ -126,30 +286,44 @@ class WallpaperScheduler(QObject):
                 if self._config.switch_mode == "random":
                     path = random.choice(candidates) if candidates else None
                 else:
-                    idx_key = str(m.monitor_id)
-                    idx = self._config.current_indexes.get(idx_key, -1)
-                    if not isinstance(idx, int):
-                        idx = -1
-                    idx = (idx + 1) % len(self._wallpaper_pool)
-                    self._config.current_indexes[idx_key] = idx
-                    path = self._wallpaper_pool[idx]
+                    idx = self._get_index(m.monitor_id, -1)
+                    step = 1 if forward else -1
+                    if idx < 0 or idx >= len(self._wallpaper_pool):
+                        idx = self._index_of(self._current_wallpapers.get(m.monitor_id))
+                        if idx < 0:
+                            idx = -1 if forward else 0
+                    idx = (idx + step) % max(1, len(self._wallpaper_pool))
+                    self._set_index(m.monitor_id, idx)
+                    self._set_preview_index(m.monitor_id, idx)
+                    path = self._path_at(idx)
                 if path:
                     wallpapers[m.monitor_id] = path
                     used_paths.add(path)
-            self._config.save()
         else:
-            path = self._select_next(monitors[0].monitor_id) if monitors else None
+            selector = self._select_next if forward else self._select_prev
+            first_mid = monitors[0].monitor_id if monitors else None
+            path = selector(first_mid) if first_mid is not None else None
             if path:
                 for m in monitors:
                     wallpapers[m.monitor_id] = path
         return wallpapers
 
     def switch_next(self, monitor_id: Optional[str] = None) -> bool:
+        return self._apply_switch(forward=True, monitor_id=monitor_id)
+
+    def switch_prev(self, monitor_id: Optional[str] = None) -> bool:
+        return self._apply_switch(forward=False, monitor_id=monitor_id)
+
+    def skip_current(self, monitor_id: Optional[str] = None) -> bool:
+        return self.switch_next(monitor_id)
+
+    def _apply_switch(self, forward: bool, monitor_id: Optional[str] = None) -> bool:
         self._refresh_pool()
         if not self._wallpaper_pool:
             return False
+        selector = self._select_next if forward else self._select_prev
         if monitor_id:
-            path = self._select_next(monitor_id)
+            path = selector(monitor_id)
             if not path:
                 return False
             self.next_wallpaper_selected.emit(monitor_id, path)
@@ -161,11 +335,12 @@ class WallpaperScheduler(QObject):
             result = self._setter.set_wallpaper_single(monitor_id, prepared)
             if result:
                 self._current_wallpapers[monitor_id] = path
+                self._preview_wallpapers.pop(monitor_id, None)
                 self._history.add_record(monitor_id, path)
                 self.wallpaper_changed.emit({monitor_id: path})
             return result
         else:
-            wallpapers = self._select_next_for_all()
+            wallpapers = self._select_next_for_all(forward=forward)
             if not wallpapers:
                 return False
             prepared_wps = {}
@@ -180,22 +355,29 @@ class WallpaperScheduler(QObject):
             result = self._setter.set_wallpaper_multiple(prepared_wps)
             if result:
                 self._current_wallpapers.update(wallpapers)
-                for mid, path in wallpapers.items():
-                    self._history.add_record(mid, path)
+                for mid in wallpapers:
+                    self._preview_wallpapers.pop(mid, None)
+                    self._history.add_record(mid, wallpapers[mid])
                 self.wallpaper_changed.emit(wallpapers)
             return result
 
     def switch_to(self, file_path: str, monitor_id: Optional[str] = None) -> bool:
         if not os.path.exists(file_path):
             return False
+        file_path = str(Path(file_path).resolve())
         monitors = self._monitor_manager.get_monitors()
         if monitor_id:
+            pool_idx = self._index_of(file_path)
+            if pool_idx >= 0:
+                self._set_index(monitor_id, pool_idx)
+                self._set_preview_index(monitor_id, pool_idx)
             self.next_wallpaper_selected.emit(monitor_id, file_path)
             monitor = self._monitor_manager.get_monitor_by_id(monitor_id)
             prepared = self._setter.prepare_image_for_monitor(file_path, monitor) if monitor else file_path
             result = self._setter.set_wallpaper_single(monitor_id, prepared)
             if result:
                 self._current_wallpapers[monitor_id] = file_path
+                self._preview_wallpapers.pop(monitor_id, None)
                 self._history.add_record(monitor_id, file_path)
                 self.wallpaper_changed.emit({monitor_id: file_path})
             return result
@@ -203,6 +385,10 @@ class WallpaperScheduler(QObject):
             wallpapers = {}
             prepared_wps = {}
             for m in monitors:
+                pool_idx = self._index_of(file_path)
+                if pool_idx >= 0:
+                    self._set_index(m.monitor_id, pool_idx)
+                    self._set_preview_index(m.monitor_id, pool_idx)
                 wallpapers[m.monitor_id] = file_path
                 self.next_wallpaper_selected.emit(m.monitor_id, file_path)
                 prepared_wps[m.monitor_id] = self._setter.prepare_image_for_monitor(file_path, m)
@@ -210,9 +396,7 @@ class WallpaperScheduler(QObject):
             if result:
                 self._current_wallpapers.update(wallpapers)
                 for mid in wallpapers:
+                    self._preview_wallpapers.pop(mid, None)
                     self._history.add_record(mid, file_path)
                 self.wallpaper_changed.emit(wallpapers)
             return result
-
-    def skip_current(self, monitor_id: Optional[str] = None) -> bool:
-        return self.switch_next(monitor_id)
