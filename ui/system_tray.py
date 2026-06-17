@@ -119,7 +119,7 @@ class SystemTrayIcon(QSystemTrayIcon):
                 act.setChecked(act is action)
         self._config.switch_mode = mode
         self._config.save()
-        self._scheduler.refresh_settings()
+        self._scheduler.rebuild_browse()
 
     def _on_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
